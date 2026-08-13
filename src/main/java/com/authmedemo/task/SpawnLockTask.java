@@ -55,6 +55,12 @@ public class SpawnLockTask implements Runnable {
             Location current = player.getLocation();
 
             boolean needTeleport = false;
+            Location target = spawn.clone();
+
+            // 【修复】保留玩家当前的 yaw 和 pitch，避免玩家转头时每5 tick被强制掰回出生点的朝向
+            // XYZ固定到 spawn，但 yaw/pitch 沿用玩家当前值，不影响"不能动"的约束，只是体验更自然
+            target.setYaw(current.getYaw());
+            target.setPitch(current.getPitch());
 
             // 兜底①：进服后前30秒，每5 tick无条件传送一次（强制同步坐标）
             if (tick < FORCE_DURATION && tick % FORCE_PERIOD == 0L) {
@@ -70,7 +76,7 @@ public class SpawnLockTask implements Runnable {
             }
 
             if (needTeleport) {
-                player.teleport(spawn);
+                player.teleport(target);
             }
         }
 

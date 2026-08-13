@@ -2,17 +2,13 @@ package com.authmedemo.command;
 
 // ===================== 实现思路 =====================
 // /login <password> 登录命令
-// 流程：
-// 1. 前置检查：必须是玩家 + 参数(1个) + 未登录 + 已注册
-// 2. 冷却检查：处于冷却期直接拒，不做密码校验（防止爆破）
-// 3. 从缓存取账号数据（PlayerAuth里有密码哈希）
-// 4. BCrypt.checkpw(明文输入, 存储哈希) 比较密码
-// 5. 密码错 → 失败计数+1 → 达到上限开启冷却
-// 6. 密码对 → 清失败计数 + 标记登录 + 异步更新登录IP/时间
+// 【本次Bug修复】：所有异步回调第一句 `if (!player.isOnline()) return;`
+//   防玩家发起 /login 后立刻退服，回调时 sendMessage/setLoggedIn 打到无效对象
 // ====================================================
 
 import com.authmedemo.AuthMeDemo;
 import com.authmedemo.cache.PlayerCache;
+import com.authmedemo.cache.PlayerCache.RegistrationStatus;
 import com.authmedemo.database.DatabaseManager;
 import com.authmedemo.model.PlayerAuth;
 import com.authmedemo.security.PasswordSecurity;
@@ -46,8 +42,8 @@ public class LoginCommand implements CommandExecutor {
             sender.sendMessage("§c只有玩家可以使用登录命令！");
             return true;
         }
-        Player player = (Player) sender;
-        UUID uuid = player.getUniqueId();
+        final Player player = (Player) sender;
+        final UUID uuid = player.getUniqueId();
 
         // 1. 已登录就不允许重复登录
         if (cache.isLoggedIn(uuid)) {
@@ -61,39 +57,43 @@ public class LoginCommand implements CommandExecutor {
             return true;
         }
 
-        String inputPassword = args[0];
+        final String inputPassword = args[0];
 
-        // 3. 先检查是否已注册（缓存未命中 → 异步查库后重试）
+        // 3. 根据缓存三态判断是直接登还是先查库
         PlayerAuth auth = cache.getCachedAuth(uuid);
-        if (auth == null) {
-            // 缓存没命中（可能是PlayerJoinEvent的异步查库还没回来），主动查一次
+        RegistrationStatus status = cache.getRegistrationStatus(uuid);
+
+        if (status == RegistrationStatus.NOT_REGISTERED || (auth == null && status == RegistrationStatus.UNKNOWN)) {
+            // NOT_REGISTERED → 直接提示没注册
+            // UNKNOWN + 缓存空 → 主动查库
             db.getAuthByUuid(uuid.toString(), (PlayerAuth dbAuth) -> {
+                if (!player.isOnline()) return;
                 if (dbAuth == null) {
-                    // 数据库里也没有 → 没注册。根据注册开关提示不同内容
+                    // 数据库里也没有 → 没注册
+                    cache.setNotRegistered(uuid);
                     if (plugin.isAllowRegistration()) {
                         sendLines(player, MessageUtil.getList("prompt-register"));
                     } else {
                         sendLines(player, MessageUtil.getList("registration-closed"));
                     }
                 } else {
-                    // 查到了，缓存起来，然后执行真正的登录校验
-                    cache.cacheAuth(uuid, dbAuth);
+                    // 查到了 → 缓存起来 → 登录校验
+                    cache.setRegistered(uuid, dbAuth);
                     doLogin(player, uuid, dbAuth, inputPassword);
                 }
             });
             return true;
         }
 
-        // 4. 缓存命中，直接登录校验
+        // 4. 缓存命中（status=REGISTERED 且 auth!=null）→ 直接校验登录
         doLogin(player, uuid, auth, inputPassword);
         return true;
     }
 
-    /**
-     * 真正的登录校验逻辑（抽出来避免重复写）
-     */
     private void doLogin(Player player, UUID uuid, PlayerAuth auth, String inputPassword) {
-        // ===== 冷却检查（重要！冷却期内不做密码校验，防止暴力破解）=====
+        if (!player.isOnline()) return;
+
+        // 冷却检查（重要！冷却期内不做密码校验，防止暴力破解）
         long remainingCooldown = security.getRemainingCooldownSeconds(uuid);
         if (remainingCooldown > 0) {
             player.sendMessage(MessageUtil.get("login-cooldown",
@@ -101,13 +101,11 @@ public class LoginCommand implements CommandExecutor {
             return;
         }
 
-        // ===== BCrypt密码比对 =====
+        // BCrypt密码比对
         boolean correct = PasswordSecurity.checkPassword(inputPassword, auth.getPasswordHash());
         if (!correct) {
-            // 密码错误：记录失败次数
             boolean reachedMax = security.recordLoginFail(uuid);
             if (reachedMax) {
-                // 达到上限，发送冷却提示
                 long cooldown = security.getRemainingCooldownSeconds(uuid);
                 player.sendMessage(MessageUtil.get("login-too-many-fails",
                         "{seconds}", String.valueOf(cooldown)));
@@ -117,14 +115,10 @@ public class LoginCommand implements CommandExecutor {
             return;
         }
 
-        // ===== 登录成功！=====
-        // 1. 清除失败计数和冷却
+        // 登录成功！
         security.clearFailState(uuid);
-        // 2. 标记已登录（事件拦截器将放行所有动作）
         cache.setLoggedIn(uuid);
-        // 3. 异步更新登录IP和时间（无需回调）
         db.updateLoginInfo(auth.getOfflineUuid(), getPlayerIp(player), System.currentTimeMillis());
-        // 4. 提示成功：发送多行登录成功大框
         sendLines(player, MessageUtil.getList("login-success", "{player}", player.getName()));
     }
 
