@@ -63,6 +63,22 @@ public class AuthMeDemo extends JavaPlugin {
 
         MessageUtil.init(getConfig());
 
+        // ===== 【新增】校验 config 关键消息 key 是否存在（防止用户用老 config 导致没提示/全是问号）=====
+        String[] requiredKeys = new String[] {
+                "messages.prompt-login",
+                "messages.prompt-register",
+                "messages.registration-closed",
+                "messages.login-success",
+                "messages.register-success",
+                "messages.not-logged-in-blocked"
+        };
+        for (String key : requiredKeys) {
+            if (!getConfig().contains(key, true)) {
+                getLogger().warning("【配置缺失】config.yml 里找不到 '" + key
+                        + "'，建议删除 plugins/AuthMeDemo/config.yml 后重启服务器让插件重新生成新版配置！");
+            }
+        }
+
         String dbFilename = getConfig().getString("database.filename", "authme.db");
         databaseManager = new DatabaseManager(this, getDataFolder(), dbFilename);
         if (!databaseManager.init()) {
@@ -94,12 +110,15 @@ public class AuthMeDemo extends JavaPlugin {
         promptTask = getServer().getScheduler().runTaskTimer(this, new PromptTask(this), 20L, intervalTicks);
         getLogger().info("已启动登录/注册重复提示任务，间隔 " + promptRepeatInterval + " 秒");
 
-        // ② 出生点强制锁定任务：每 tick 拉回一次（如果配置开启）
+        // ② 出生点强制锁定任务：始终启动（不管配置怎么写），settings.force-spawn-location 仅控制日志
+        // 任务内部有两层兜底：进服30秒每5tick强传 + 全程超偏移即传
+        // 不再依赖 forceSpawnLocation 开关，防止用户把开关配成 false 后玩家乱跑
+        spawnLockTask = getServer().getScheduler().runTaskTimer(this, new SpawnLockTask(this), 0L, 1L);
         if (forceSpawnLocation) {
-            spawnLockTask = getServer().getScheduler().runTaskTimer(this, new SpawnLockTask(this), 0L, 1L);
-            getLogger().info("已启用出生点强制锁定（未登录玩家每 tick 被拉回出生点）");
+            getLogger().info("已启用出生点强制锁定（每 tick 拉回 + 进服30秒每5 tick强传）");
         } else {
-            getLogger().info("出生点强制锁定未启用，仅通过事件取消移动");
+            getLogger().warning("配置中 settings.force-spawn-location=false，但锁定任务仍会强制运行（安全兜底），"
+                    + "如确需关闭请修改 SpawnLockTask 的调度代码。");
         }
 
         long cost = System.currentTimeMillis() - startTime;

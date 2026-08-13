@@ -2,23 +2,26 @@ package com.authmedemo.listener;
 
 // ===================== 实现思路 =====================
 // 玩家事件监听器：核心业务逻辑
-// 【进服新增】
-//   - PlayerJoinEvent 立刻同步传送到世界出生点（不管SpawnLockTask是否开启，先固定住）
-//   - 查库结束后不再只发单行，而是立刻发一次注册/登录大框（配合PromptTask每N秒重复）
-//   - 如果 settings.allow-registration=false 且 玩家未注册，立刻提示"注册已关闭"
-// 【命令白名单新增】
-//   - 注册关闭时，未注册玩家即使输 /register 也被拒（提示注册已关闭）
-// 【新增事件拦截】
-//   - 骑乘实体（上矿车/上猪等）、实体伤害（防止自残/PVP）、食用物品（防止吃东西）
+// 【本次大量Bug修复——对齐AuthMe实现】
+// 1. Join处理：先 prepareForJoin(UNKNOWN) → 延迟1tick teleport → 查库 → setRegistered/setNotRegistered
+// 2. 命令白名单：
+//    - 新增"命令太快"保护（进服800ms内禁输命令，对齐AuthMe的"You used a command too fast"）
+//    - 命令命名空间归一化：/minecraft:login / authmedemo:reg / login → 只看最后一个冒号后的名字
+//    - 白名单同时包含 plugin.yml 中所有别名（l、reg、cpw、changepw）
+// 3. 新增 PlayerTeleportEvent 拦截：未登录玩家只能去出生点，其他插件/玩家传送全部取消
+// 4. 新增 PlayerToggleFlightEvent 拦截：未登录玩家不许切换飞行
 // ====================================================
 
 import com.authmedemo.AuthMeDemo;
 import com.authmedemo.cache.PlayerCache;
+import com.authmedemo.cache.PlayerCache.RegistrationStatus;
 import com.authmedemo.database.DatabaseManager;
 import com.authmedemo.model.PlayerAuth;
 import com.authmedemo.security.SecurityManager;
 import com.authmedemo.util.MessageUtil;
+import org.bukkit.Bukkit;
 import org.bukkit.Location;
+import org.bukkit.World;
 import org.bukkit.entity.Player;
 import org.bukkit.event.Cancellable;
 import org.bukkit.event.EventHandler;
@@ -32,6 +35,8 @@ import org.bukkit.event.inventory.InventoryOpenEvent;
 import org.bukkit.event.player.*;
 import org.bukkit.event.vehicle.VehicleEnterEvent;
 
+import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
 import java.util.UUID;
 
@@ -42,6 +47,21 @@ public class PlayerListener implements Listener {
     private final PlayerCache cache;
     private final SecurityManager security;
 
+    // ===================== 允许未登录玩家使用的命令（含别名，命名空间归一化后匹配）=====================
+    // 对应 plugin.yml 里的 commands 段 + aliases 全部展开
+    private static final HashSet<String> ALLOWED_COMMANDS = new HashSet<>(Arrays.asList(
+            "login", "l",                              // /login 别名
+            "register", "reg",                         // /register 别名
+            "changepassword", "cpw", "changepw",       // /changepassword 别名（理论上要登录才用，白名单放行不影响，命令内部已做已登录校验）
+            "logout",                                   // /logout（已登录才用，但别拦命令，让命令自己拒）
+            "adminauthme"                               // 管理员命令（内部有权限校验）
+    ));
+
+    // 哪些命令属于"登录/注册类"——只有这些在 UNKNOWN 状态下可以先放行，让用户输了不被"命令太快"或"加载中"阻止
+    private static final HashSet<String> AUTH_COMMANDS = new HashSet<>(Arrays.asList(
+            "login", "l", "register", "reg"
+    ));
+
     public PlayerListener(AuthMeDemo plugin) {
         this.plugin = plugin;
         this.db = plugin.getDatabaseManager();
@@ -49,40 +69,49 @@ public class PlayerListener implements Listener {
         this.security = plugin.getSecurityManager();
     }
 
-    // ===================== 玩家进服：立即固定到出生点 + 异步查库 =====================
+    // ===================== 玩家进服：先UNKNOWN → 延迟1tick传送+查库 =====================
 
     @EventHandler(priority = EventPriority.HIGHEST)
     public void onPlayerJoin(PlayerJoinEvent event) {
-        Player player = event.getPlayer();
-        UUID uuid = player.getUniqueId();
+        final Player player = event.getPlayer();
+        final UUID uuid = player.getUniqueId();
 
-        // 清旧缓存
+        // 1. 清理旧缓存（包含登录/注册/失败计数）
         cache.clearPlayer(uuid);
         security.clearFailState(uuid);
 
-        // 【核心加强】进服立刻同步传送到当前世界出生点，不管SpawnLockTask开没开
-        // 确保玩家一进服视线就是出生点，不会"走两步"再被拉回
-        Location spawn = player.getWorld().getSpawnLocation();
-        player.teleport(spawn);
+        // 2. 【关键】注册状态置为 UNKNOWN（查库空窗期中间态），并记录进服时间戳
+        cache.prepareForJoin(uuid);
 
-        String offlineUuidStr = uuid.toString();
+        final String offlineUuidStr = uuid.toString();
+        final String ip = getPlayerIp(player);
 
-        // 异步查库（回调在主线程）
-        db.getAuthByUuid(offlineUuidStr, (PlayerAuth auth) -> {
-            if (auth != null) {
-                // 情况B：已注册但未登录 → 缓存账号 + 立刻发一次"请登录"大框
-                cache.cacheAuth(uuid, auth);
-                db.updateLoginInfo(offlineUuidStr, getPlayerIp(player), System.currentTimeMillis());
-                sendLines(player, MessageUtil.getList("prompt-login"));
-            } else {
-                // 情况A：未注册 → 看开关决定发"请注册"还是"注册已关闭"
-                if (plugin.isAllowRegistration()) {
-                    sendLines(player, MessageUtil.getList("prompt-register"));
+        // 3. 延迟 1 tick 后执行（绕开 NMS 覆盖坐标 + 其他插件抛错打断事件链）
+        Bukkit.getScheduler().runTaskLater(plugin, () -> {
+            if (!player.isOnline()) return;
+
+            // 3a) 强制传送到当前世界出生点
+            player.teleport(player.getWorld().getSpawnLocation());
+
+            // 3b) 异步查库，查完后必须更新注册状态三态（setRegistered / setNotRegistered）
+            db.getAuthByUuid(offlineUuidStr, (PlayerAuth auth) -> {
+                if (!player.isOnline()) return;
+                if (auth != null) {
+                    // 已注册：缓存 + 更新登录信息 + 发登录大框
+                    cache.setRegistered(uuid, auth);
+                    db.updateLoginInfo(offlineUuidStr, ip, System.currentTimeMillis());
+                    sendLines(player, MessageUtil.getList("prompt-login"));
                 } else {
-                    sendLines(player, MessageUtil.getList("registration-closed"));
+                    // 未注册：标记 NOT_REGISTERED + 根据注册开关发提示
+                    cache.setNotRegistered(uuid);
+                    if (plugin.isAllowRegistration()) {
+                        sendLines(player, MessageUtil.getList("prompt-register"));
+                    } else {
+                        sendLines(player, MessageUtil.getList("registration-closed"));
+                    }
                 }
-            }
-        });
+            });
+        }, 1L);
     }
 
     // ===================== 玩家退出：清理 =====================
@@ -93,45 +122,99 @@ public class PlayerListener implements Listener {
         security.clearPlayer(uuid);
     }
 
-    // ===================== 命令白名单（支持注册开关）=====================
+    // ===================== 命令白名单（含命名空间归一化+命令太快保护）=====================
     @EventHandler(priority = EventPriority.LOWEST, ignoreCancelled = true)
     public void onPlayerCommand(PlayerCommandPreprocessEvent event) {
         Player player = event.getPlayer();
         UUID uuid = player.getUniqueId();
-        if (cache.isLoggedIn(uuid)) return;
 
-        String msg = event.getMessage().toLowerCase();
-        if (msg.startsWith("/")) msg = msg.substring(1);
-        String cmdName = msg.split(" ")[0];
+        if (cache.isLoggedIn(uuid)) return; // 已登录 → 完全放行
 
-        // 1. 先判断是不是白名单命令
-        boolean allowCmd = false;
-        boolean isRegisterCmd = false;
-        switch (cmdName) {
-            case "login":
-            case "l":
-                allowCmd = true;
-                break;
-            case "register":
-            case "reg":
-                allowCmd = true;
-                isRegisterCmd = true;
-                break;
+        // 【修复1】命令太快保护：进服 800ms 内禁输命令，玩家爆破/机器人
+        if (cache.isCommandTooFast(uuid)) {
+            event.setCancelled(true);
+            player.sendMessage("§c§l你使用命令的速度太快！请重新连接服务器并稍等片刻再输入命令。");
+            // AuthMe原版：严重的命令刷会踢玩家。demo版先只拦不踢。
+            return;
         }
-        if (!allowCmd) {
+
+        // 【修复2】命名空间归一化
+        // 用户可能输入：/login · /minecraft:login · /authmedemo:reg · /plugins:login
+        // 统一去掉开头 "/"，然后取最后一个冒号 ":" 后面的字符串作为命令名
+        String rawMsg = event.getMessage();
+        String msg = (rawMsg != null && rawMsg.startsWith("/")) ? rawMsg.substring(1) : rawMsg;
+        if (msg == null || msg.isEmpty()) {
+            event.setCancelled(true);
+            return;
+        }
+        // 取"空格前"的部分，兼容 /login 123 这种有参数的情况
+        String firstToken = msg.split(" ")[0];
+        // 取最后一个冒号后面的字符串 → 真正的命令名
+        int lastColon = firstToken.lastIndexOf(':');
+        String cmdName = (lastColon >= 0) ? firstToken.substring(lastColon + 1) : firstToken;
+        cmdName = cmdName.toLowerCase();
+
+        // 【查库空窗期保护】注册状态还是 UNKNOWN 时：
+        //   - 只允许 /login /register 这两个 auth 类命令通过
+        //   - 其它命令一律拦，免得我们判不准他是注册还是未注册（虽然我们会拦截所有非白名单，但这里多一层保险）
+        RegistrationStatus status = cache.getRegistrationStatus(uuid);
+        if (status == RegistrationStatus.UNKNOWN && !AUTH_COMMANDS.contains(cmdName)) {
+            event.setCancelled(true);
+            player.sendMessage("§e§l[系统] 账号数据加载中，请稍等一秒后再操作...");
+            return;
+        }
+
+        // 白名单判定
+        if (!ALLOWED_COMMANDS.contains(cmdName)) {
             event.setCancelled(true);
             player.sendMessage(MessageUtil.get("not-logged-in-command"));
             return;
         }
 
-        // 2. 注册命令额外检查：若管理员关了注册开关，不允许执行
+        // 注册命令：注册关闭时再兜底拦截
+        boolean isRegisterCmd = "register".equals(cmdName) || "reg".equals(cmdName);
         if (isRegisterCmd && !plugin.isAllowRegistration()) {
             event.setCancelled(true);
             sendLines(player, MessageUtil.getList("registration-closed"));
         }
     }
 
-    // ===================== 移动拦截（即使被外力推，事件也cancel）=====================
+    // ===================== 玩家传送事件（防其他插件把未登录玩家传走）=====================
+    // 其他插件（Essentials/Multiverse/权限组）可能触发传送，直接cancel掉，目的地只允许等于世界出生点
+    @EventHandler(priority = EventPriority.LOWEST, ignoreCancelled = true)
+    public void onPlayerTeleport(PlayerTeleportEvent event) {
+        Player player = event.getPlayer();
+        UUID uuid = player.getUniqueId();
+        if (cache.isLoggedIn(uuid)) return;
+
+        Location to = event.getTo();
+        if (to == null) return;
+
+        World world = to.getWorld();
+        if (world == null) {
+            event.setCancelled(true);
+            return;
+        }
+        Location spawn = world.getSpawnLocation();
+        double dx = Math.abs(to.getX() - spawn.getX());
+        double dy = Math.abs(to.getY() - spawn.getY());
+        double dz = Math.abs(to.getZ() - spawn.getZ());
+        // 目的地不等于出生点 → cancel（偏移 > 1格就算是别的插件传的，我们传的偏移是0）
+        if (dx > 1.0 || dy > 1.0 || dz > 1.0) {
+            event.setCancelled(true);
+        }
+    }
+
+    // ===================== 切换飞行（防飞行权限把玩家带出出生点）=====================
+    @EventHandler(priority = EventPriority.LOWEST, ignoreCancelled = true)
+    public void onToggleFlight(PlayerToggleFlightEvent event) {
+        Player p = event.getPlayer();
+        if (!cache.isLoggedIn(p.getUniqueId())) {
+            event.setCancelled(true);
+        }
+    }
+
+    // ===================== 移动拦截 =====================
     @EventHandler(priority = EventPriority.LOWEST, ignoreCancelled = true)
     public void onPlayerMove(PlayerMoveEvent event) {
         Player player = event.getPlayer();
@@ -150,7 +233,9 @@ public class PlayerListener implements Listener {
         Player player = event.getPlayer();
         if (!cache.isLoggedIn(player.getUniqueId())) {
             event.setCancelled(true);
-            player.sendMessage(MessageUtil.get("not-logged-in-chat"));
+            // 异步事件里 sendMessage 要丢回主线程（Bukkit API要求）
+            Bukkit.getScheduler().runTask(plugin, () ->
+                    player.sendMessage(MessageUtil.get("not-logged-in-chat")));
         }
     }
 
@@ -168,7 +253,7 @@ public class PlayerListener implements Listener {
     @EventHandler(priority = EventPriority.LOWEST, ignoreCancelled = true)
     public void onPickupItem(PlayerPickupItemEvent event) { cancelIfNotLoggedIn(event.getPlayer(), event, null); }
 
-    // 【新增】拦截上矿车/上船/骑猪（防止玩家靠骑乘离开出生点）
+    // 【新增】拦截上矿车/上船/骑猪
     @EventHandler(priority = EventPriority.LOWEST, ignoreCancelled = true)
     public void onVehicleEnter(VehicleEnterEvent event) {
         if (event.getEntered() instanceof Player) {
@@ -176,7 +261,7 @@ public class PlayerListener implements Listener {
         }
     }
 
-    // 【新增】拦截受伤（包括PVP、自残、跌落、爆炸），防止未登录玩家靠自杀/卡BUG
+    // 【新增】拦截受伤
     @EventHandler(priority = EventPriority.LOWEST, ignoreCancelled = true)
     public void onEntityDamage(EntityDamageEvent event) {
         if (event.getEntity() instanceof Player) {
@@ -187,7 +272,7 @@ public class PlayerListener implements Listener {
         }
     }
 
-    // 【新增】拦截饥饿度变化，未登录玩家不会饿也不会回血
+    // 【新增】拦截饥饿度变化
     @EventHandler(priority = EventPriority.LOWEST, ignoreCancelled = true)
     public void onFoodLevelChange(FoodLevelChangeEvent event) {
         if (event.getEntity() instanceof Player) {

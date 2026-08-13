@@ -86,9 +86,9 @@ public class ChangePasswordCommand implements CommandExecutor {
         // 7. 【异步】更新数据库
         db.updatePassword(auth.getOfflineUuid(), newHash, (Boolean success) -> {
             if (success) {
-                // 更新缓存中的哈希
+                // 更新缓存中的密码哈希 → 对外统一入口 setRegistered（内部会更新 authCache+regStatus）
                 auth.setPasswordHash(newHash);
-                cache.cacheAuth(uuid, auth);
+                cache.setRegistered(uuid, auth);
                 player.sendMessage(MessageUtil.get("changepassword-success"));
             } else {
                 player.sendMessage(MessageUtil.get("database-error"));
