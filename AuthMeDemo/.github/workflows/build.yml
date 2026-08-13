@@ -1,0 +1,48 @@
+# =====================================================
+# GitHub Actions 云构建工作流
+# 触发条件：push 到任意分支 / 针对 main 分支的 PR
+# 功能：Java 8 环境下 mvn 编译打包，上传 jar 产物
+# =====================================================
+name: Build
+
+on:
+  # push 到任意分支时触发
+  push:
+    branches: [ "**" ]
+  # 针对 main 分支提交 PR 时触发
+  pull_request:
+    branches: [ main ]
+
+# 同一分支多次 push 时取消旧构建，节省额度
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # 1. 拉取代码
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 2. 配置 JDK 8（与项目 pom.xml 中的 java.version 一致，兼容 1.16.5 服务端）
+      - name: Setup JDK 8
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '8'
+          cache: maven
+
+      # 3. 编译打包（shade 插件会把 SQLite + jBCrypt 打进最终 jar）
+      - name: Build with Maven
+        run: mvn -B clean package -DskipTests
+
+      # 4. 上传构建产物（jar），保留 30 天
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AuthMeDemo-${{ github.sha }}
+          path: target/AuthMeDemo-*.jar
+          retention-days: 30
+          if-no-files-found: error
