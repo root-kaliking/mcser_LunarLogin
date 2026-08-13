@@ -23,6 +23,7 @@ import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
 import org.bukkit.entity.Player;
 
+import java.util.List;
 import java.util.UUID;
 
 public class LoginCommand implements CommandExecutor {
@@ -68,8 +69,12 @@ public class LoginCommand implements CommandExecutor {
             // 缓存没命中（可能是PlayerJoinEvent的异步查库还没回来），主动查一次
             db.getAuthByUuid(uuid.toString(), (PlayerAuth dbAuth) -> {
                 if (dbAuth == null) {
-                    // 数据库里也没有 → 没注册
-                    player.sendMessage(MessageUtil.get("login-not-registered"));
+                    // 数据库里也没有 → 没注册。根据注册开关提示不同内容
+                    if (plugin.isAllowRegistration()) {
+                        sendLines(player, MessageUtil.getList("prompt-register"));
+                    } else {
+                        sendLines(player, MessageUtil.getList("registration-closed"));
+                    }
                 } else {
                     // 查到了，缓存起来，然后执行真正的登录校验
                     cache.cacheAuth(uuid, dbAuth);
@@ -119,9 +124,12 @@ public class LoginCommand implements CommandExecutor {
         cache.setLoggedIn(uuid);
         // 3. 异步更新登录IP和时间（无需回调）
         db.updateLoginInfo(auth.getOfflineUuid(), getPlayerIp(player), System.currentTimeMillis());
-        // 4. 提示成功
-        player.sendMessage(MessageUtil.get("login-success",
-                "{player}", player.getName()));
+        // 4. 提示成功：发送多行登录成功大框
+        sendLines(player, MessageUtil.getList("login-success", "{player}", player.getName()));
+    }
+
+    private void sendLines(Player player, List<String> lines) {
+        for (String l : lines) player.sendMessage(l);
     }
 
     private String getPlayerIp(Player player) {
