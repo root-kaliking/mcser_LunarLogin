@@ -18,6 +18,7 @@ import com.authmedemo.database.DatabaseManager;
 import com.authmedemo.model.PlayerAuth;
 import com.authmedemo.security.SecurityManager;
 import com.authmedemo.util.MessageUtil;
+import org.bukkit.Bukkit;
 import org.bukkit.Location;
 import org.bukkit.entity.Player;
 import org.bukkit.event.Cancellable;
@@ -49,40 +50,55 @@ public class PlayerListener implements Listener {
         this.security = plugin.getSecurityManager();
     }
 
-    // ===================== 玩家进服：立即固定到出生点 + 异步查库 =====================
-
+    // ===================== 玩家进服：延迟1tick固定出生点 + 异步查库 =====================
+    // 【为什么延迟1tick？两个致命坑：】
+    //  1. 1.16.5 NMS 在 PlayerJoinEvent 回调完之后，还会再把玩家"放置"到客户端连接时的坐标
+    //     → 我们在事件里的 teleport 会被 NMS 覆盖，等于没传
+    //  2. 同一个 PlayerJoinEvent 上如果前面的插件（比如你日志里的 Arcade v1.51d）抛了未捕获异常，
+    //     Bukkit 会直接中断事件链，后面我们的同步代码根本跑不到 → 没传送 + 没查库 + 没提示
+    //  【解决方案】事件里只做最轻的缓存清理，然后 runTaskLater 延迟1 tick。
+    //  这是 Bukkit 调度器，和事件链完全独立，前面插件再怎么炸都不影响我们执行。
+    // ====================================================================================
     @EventHandler(priority = EventPriority.HIGHEST)
     public void onPlayerJoin(PlayerJoinEvent event) {
-        Player player = event.getPlayer();
-        UUID uuid = player.getUniqueId();
+        final Player player = event.getPlayer();
+        final UUID uuid = player.getUniqueId();
 
-        // 清旧缓存
+        // 只做最轻的内存清理，不做任何IO和传送
         cache.clearPlayer(uuid);
         security.clearFailState(uuid);
 
-        // 【核心加强】进服立刻同步传送到当前世界出生点，不管SpawnLockTask开没开
-        // 确保玩家一进服视线就是出生点，不会"走两步"再被拉回
-        Location spawn = player.getWorld().getSpawnLocation();
-        player.teleport(spawn);
+        final String offlineUuidStr = uuid.toString();
+        final String ip = getPlayerIp(player);
 
-        String offlineUuidStr = uuid.toString();
+        // 延迟 1 tick 后执行：此时 NMS 已经放完玩家位置，且其他插件的异常不会干扰我们
+        Bukkit.getScheduler().runTaskLater(plugin, () -> {
+            // 双重校验：玩家是否还在线（极端情况1tick内已经被踢出去了）
+            if (!player.isOnline()) return;
 
-        // 异步查库（回调在主线程）
-        db.getAuthByUuid(offlineUuidStr, (PlayerAuth auth) -> {
-            if (auth != null) {
-                // 情况B：已注册但未登录 → 缓存账号 + 立刻发一次"请登录"大框
-                cache.cacheAuth(uuid, auth);
-                db.updateLoginInfo(offlineUuidStr, getPlayerIp(player), System.currentTimeMillis());
-                sendLines(player, MessageUtil.getList("prompt-login"));
-            } else {
-                // 情况A：未注册 → 看开关决定发"请注册"还是"注册已关闭"
-                if (plugin.isAllowRegistration()) {
-                    sendLines(player, MessageUtil.getList("prompt-register"));
+            // 1. 强制传送到当前世界出生点（这次不会被 NMS 覆盖）
+            Location spawn = player.getWorld().getSpawnLocation();
+            player.teleport(spawn);
+
+            // 2. 异步查库，查完立刻发一次"请登录"或"请注册"大框
+            db.getAuthByUuid(offlineUuidStr, (PlayerAuth auth) -> {
+                // 查库回调也是主线程，再校验一次玩家是否还在线
+                if (!player.isOnline()) return;
+                if (auth != null) {
+                    // 已注册但未登录：缓存账号 + 立刻发"请登录"大框
+                    cache.cacheAuth(uuid, auth);
+                    db.updateLoginInfo(offlineUuidStr, ip, System.currentTimeMillis());
+                    sendLines(player, MessageUtil.getList("prompt-login"));
                 } else {
-                    sendLines(player, MessageUtil.getList("registration-closed"));
+                    // 未注册：根据注册开关发不同的大框
+                    if (plugin.isAllowRegistration()) {
+                        sendLines(player, MessageUtil.getList("prompt-register"));
+                    } else {
+                        sendLines(player, MessageUtil.getList("registration-closed"));
+                    }
                 }
-            }
-        });
+            });
+        }, 1L);
     }
 
     // ===================== 玩家退出：清理 =====================
