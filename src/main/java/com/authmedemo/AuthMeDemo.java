@@ -2,10 +2,11 @@ package com.authmedemo;
 
 // ===================== 实现思路 =====================
 // 插件主类：所有管理器的装配入口
-// 生命周期：
-//   onEnable()  → 加载配置 → 初始化数据库 → 初始化管理器 → 注册事件/命令
-//   onDisable() → 关闭数据库 → 清理缓存
-// 所有管理器单例通过此主类暴露，其他模块通过AuthMeDemo.getInstance()获取
+// 新增3个settings配置：allow-registration、force-spawn-location、prompt-repeat-interval
+// onEnable最后启动两个Bukkit调度任务：
+//   ① PromptTask  - 每隔 N 秒，给未登录玩家循环发送注册/登录大框提示
+//   ② SpawnLockTask- 每 tick 把未登录玩家强制拉回世界出生点（防活塞/水流/爆炸推动）
+// onDisable 时 Bukkit 会自动清理它创建的任务，无需手动cancel
 // ====================================================
 
 import com.authmedemo.cache.PlayerCache;
@@ -13,42 +14,55 @@ import com.authmedemo.command.*;
 import com.authmedemo.database.DatabaseManager;
 import com.authmedemo.listener.PlayerListener;
 import com.authmedemo.security.SecurityManager;
+import com.authmedemo.task.PromptTask;
+import com.authmedemo.task.SpawnLockTask;
 import com.authmedemo.util.MessageUtil;
 import org.bukkit.plugin.java.JavaPlugin;
+import org.bukkit.scheduler.BukkitTask;
 
 public class AuthMeDemo extends JavaPlugin {
 
-    // 单例引用（插件实例）
     private static AuthMeDemo instance;
 
     // ===== 各管理器实例 =====
-    private DatabaseManager databaseManager;   // SQLite数据库
-    private PlayerCache playerCache;           // 内存缓存
-    private SecurityManager securityManager;   // 安全限制（失败计数/冷却）
+    private DatabaseManager databaseManager;
+    private PlayerCache playerCache;
+    private SecurityManager securityManager;
 
     // ===== 配置参数缓存 =====
     private int minPasswordLength;
     private int maxLoginFails;
     private int cooldownSeconds;
 
+    // ===== 【新增】settings 配置 =====
+    private boolean allowRegistration;      // 是否允许玩家自行注册
+    private boolean forceSpawnLocation;     // 是否强制锁定到出生点
+    private int promptRepeatInterval;       // 重复提示间隔（秒）
+
+    // ===== 调度任务ID引用（onDisable时无需手动cancel，Bukkit会清理）=====
+    private BukkitTask promptTask;
+    private BukkitTask spawnLockTask;
+
     @Override
     public void onEnable() {
         instance = this;
         long startTime = System.currentTimeMillis();
 
-        // 1. 保存默认配置（如果config.yml不存在则从jar内resources拷贝）
         saveDefaultConfig();
-        reloadConfig(); // 确保加载最新
+        reloadConfig();
 
-        // 2. 从config读取参数缓存
-        minPasswordLength = getConfig().getInt("security.min-password-length", 4);
-        maxLoginFails = getConfig().getInt("security.max-login-fails", 5);
-        cooldownSeconds = getConfig().getInt("security.login-cooldown-seconds", 60);
+        // ===== 读取所有配置参数 =====
+        minPasswordLength     = getConfig().getInt("security.min-password-length", 4);
+        maxLoginFails         = getConfig().getInt("security.max-login-fails", 5);
+        cooldownSeconds       = getConfig().getInt("security.login-cooldown-seconds", 60);
+        allowRegistration     = getConfig().getBoolean("settings.allow-registration", true);
+        forceSpawnLocation    = getConfig().getBoolean("settings.force-spawn-location", true);
+        promptRepeatInterval  = getConfig().getInt("settings.prompt-repeat-interval", 3);
+        // 提示间隔保护：防止配成 0 导致每 tick 刷屏
+        if (promptRepeatInterval < 1) promptRepeatInterval = 1;
 
-        // 3. 初始化消息工具类（注入config引用）
         MessageUtil.init(getConfig());
 
-        // 4. 初始化数据库管理器
         String dbFilename = getConfig().getString("database.filename", "authme.db");
         databaseManager = new DatabaseManager(this, getDataFolder(), dbFilename);
         if (!databaseManager.init()) {
@@ -57,14 +71,11 @@ public class AuthMeDemo extends JavaPlugin {
             return;
         }
 
-        // 5. 初始化缓存和安全管理器
         playerCache = new PlayerCache();
         securityManager = new SecurityManager(maxLoginFails, cooldownSeconds);
 
-        // 6. 注册事件监听器
         getServer().getPluginManager().registerEvents(new PlayerListener(this), this);
 
-        // 7. 注册命令处理器（plugin.yml里注册的命令名必须和这里setExecutor的name一致）
         try {
             getCommand("register").setExecutor(new RegisterCommand(this));
             getCommand("login").setExecutor(new LoginCommand(this));
@@ -77,46 +88,50 @@ public class AuthMeDemo extends JavaPlugin {
             return;
         }
 
+        // ===== 【新增】启动定时调度任务 =====
+        // ① 重复提示任务：间隔 N 秒 * 20 tick，延迟 1 秒后第一次执行
+        long intervalTicks = (long) promptRepeatInterval * 20L;
+        promptTask = getServer().getScheduler().runTaskTimer(this, new PromptTask(this), 20L, intervalTicks);
+        getLogger().info("已启动登录/注册重复提示任务，间隔 " + promptRepeatInterval + " 秒");
+
+        // ② 出生点强制锁定任务：每 tick 拉回一次（如果配置开启）
+        if (forceSpawnLocation) {
+            spawnLockTask = getServer().getScheduler().runTaskTimer(this, new SpawnLockTask(this), 0L, 1L);
+            getLogger().info("已启用出生点强制锁定（未登录玩家每 tick 被拉回出生点）");
+        } else {
+            getLogger().info("出生点强制锁定未启用，仅通过事件取消移动");
+        }
+
         long cost = System.currentTimeMillis() - startTime;
         getLogger().info("AuthMeDemo 插件已启用！耗时 " + cost + "ms");
-        getLogger().info("密码最小长度: " + minPasswordLength +
-                " 最大失败次数: " + maxLoginFails +
-                " 冷却时间: " + cooldownSeconds + "s");
+        getLogger().info("注册功能开关: " + (allowRegistration ? "开启" : "关闭")
+                + " | 出生点锁定: " + (forceSpawnLocation ? "开启" : "关闭")
+                + " | 提示间隔: " + promptRepeatInterval + "s");
     }
 
     @Override
     public void onDisable() {
         getLogger().info("AuthMeDemo 插件正在关闭...");
-        // 清理缓存
         if (playerCache != null) {
             playerCache.clearAll();
         }
-        // 关闭数据库连接
         if (databaseManager != null) {
             databaseManager.close();
         }
         instance = null;
     }
 
-    // ===================== 单例Getters（供其他模块使用）=====================
-
+    // ===================== Getters =====================
     public static AuthMeDemo getInstance() {
         return instance;
     }
+    public DatabaseManager getDatabaseManager() { return databaseManager; }
+    public PlayerCache getPlayerCache()         { return playerCache; }
+    public SecurityManager getSecurityManager() { return securityManager; }
+    public int getMinPasswordLength()           { return minPasswordLength; }
 
-    public DatabaseManager getDatabaseManager() {
-        return databaseManager;
-    }
-
-    public PlayerCache getPlayerCache() {
-        return playerCache;
-    }
-
-    public SecurityManager getSecurityManager() {
-        return securityManager;
-    }
-
-    public int getMinPasswordLength() {
-        return minPasswordLength;
-    }
+    // 新增 settings 配置对外暴露
+    public boolean isAllowRegistration()  { return allowRegistration; }
+    public boolean isForceSpawnLocation() { return forceSpawnLocation; }
+    public int getPromptRepeatInterval()  { return promptRepeatInterval; }
 }

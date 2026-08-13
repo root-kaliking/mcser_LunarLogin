@@ -14,13 +14,17 @@ import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
 import org.bukkit.entity.Player;
 
+import java.util.List;
 import java.util.UUID;
 
 public class LogoutCommand implements CommandExecutor {
 
     private final PlayerCache cache;
+    // 新增主类引用用于取配置开关
+    private final AuthMeDemo plugin;
 
     public LogoutCommand(AuthMeDemo plugin) {
+        this.plugin = plugin;
         this.cache = plugin.getPlayerCache();
     }
 
@@ -42,8 +46,12 @@ public class LogoutCommand implements CommandExecutor {
         // 清除登录状态（事件监听器会立即冻结玩家动作）
         cache.setLoggedOut(uuid);
         player.sendMessage(MessageUtil.get("logout-success"));
-        // 提示重新登录
-        player.sendMessage(MessageUtil.get("join-registered"));
+        // 登出后立刻再发一次登录提示大框（PromptTask也会重复发，保证视觉强制）
+        sendLines(player, MessageUtil.getList("prompt-login"));
         return true;
+    }
+
+    private void sendLines(Player player, List<String> lines) {
+        for (String l : lines) player.sendMessage(l);
     }
 }

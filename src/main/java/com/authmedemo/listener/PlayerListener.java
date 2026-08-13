@@ -1,23 +1,15 @@
 package com.authmedemo.listener;
 
 // ===================== 实现思路 =====================
-// 玩家事件监听器：核心业务逻辑所在
-// 对齐AuthMeReloaded行为：
-// 【进服流程】
-//   PlayerJoinEvent触发 → 异步查库：
-//     → 未注册(没记录)：冻结玩家，提示/register
-//     → 已注册但未登录：冻结玩家，提示/login
-//     → 注意：玩家UUID不会变，用UUID做查库和缓存key
-//
-// 【未登录拦截】（以下事件如果玩家未登录全部取消）：
-//   - PlayerMoveEvent：禁止移动（AuthMe甚至会把玩家传送回出生点）
-//   - AsyncPlayerChatEvent：禁止聊天
-//   - PlayerCommandPreprocessEvent：只允许/login和/register（含别名）
-//   - PlayerInteractEvent：禁止点击方块/物品（开箱等）
-//   - BlockBreakEvent/BlockPlaceEvent：禁止破坏/放置
-//   - PlayerDropItemEvent/InventoryOpenEvent：禁止丢东西/开背包
-//
-// 【退出清理】PlayerQuitEvent → 清登录状态+清缓存+清失败计数
+// 玩家事件监听器：核心业务逻辑
+// 【进服新增】
+//   - PlayerJoinEvent 立刻同步传送到世界出生点（不管SpawnLockTask是否开启，先固定住）
+//   - 查库结束后不再只发单行，而是立刻发一次注册/登录大框（配合PromptTask每N秒重复）
+//   - 如果 settings.allow-registration=false 且 玩家未注册，立刻提示"注册已关闭"
+// 【命令白名单新增】
+//   - 注册关闭时，未注册玩家即使输 /register 也被拒（提示注册已关闭）
+// 【新增事件拦截】
+//   - 骑乘实体（上矿车/上猪等）、实体伤害（防止自残/PVP）、食用物品（防止吃东西）
 // ====================================================
 
 import com.authmedemo.AuthMeDemo;
@@ -26,6 +18,7 @@ import com.authmedemo.database.DatabaseManager;
 import com.authmedemo.model.PlayerAuth;
 import com.authmedemo.security.SecurityManager;
 import com.authmedemo.util.MessageUtil;
+import org.bukkit.Location;
 import org.bukkit.entity.Player;
 import org.bukkit.event.Cancellable;
 import org.bukkit.event.EventHandler;
@@ -33,9 +26,13 @@ import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.block.BlockBreakEvent;
 import org.bukkit.event.block.BlockPlaceEvent;
+import org.bukkit.event.entity.EntityDamageEvent;
+import org.bukkit.event.entity.FoodLevelChangeEvent;
 import org.bukkit.event.inventory.InventoryOpenEvent;
 import org.bukkit.event.player.*;
+import org.bukkit.event.vehicle.VehicleEnterEvent;
 
+import java.util.List;
 import java.util.UUID;
 
 public class PlayerListener implements Listener {
@@ -52,179 +49,162 @@ public class PlayerListener implements Listener {
         this.security = plugin.getSecurityManager();
     }
 
-    // ===================== 玩家进服：核心入口逻辑 =====================
+    // ===================== 玩家进服：立即固定到出生点 + 异步查库 =====================
 
     @EventHandler(priority = EventPriority.HIGHEST)
     public void onPlayerJoin(PlayerJoinEvent event) {
         Player player = event.getPlayer();
         UUID uuid = player.getUniqueId();
 
-        // 1. 先清理该UUID可能残留的旧缓存（比如服务器重启前没清干净）
+        // 清旧缓存
         cache.clearPlayer(uuid);
         security.clearFailState(uuid);
 
-        // 2. 获取离线UUID字符串（Bukkit在online-mode=false时会自动算好）
+        // 【核心加强】进服立刻同步传送到当前世界出生点，不管SpawnLockTask开没开
+        // 确保玩家一进服视线就是出生点，不会"走两步"再被拉回
+        Location spawn = player.getWorld().getSpawnLocation();
+        player.teleport(spawn);
+
         String offlineUuidStr = uuid.toString();
 
-        // 3. 【异步】查数据库判断玩家是否注册过
+        // 异步查库（回调在主线程）
         db.getAuthByUuid(offlineUuidStr, (PlayerAuth auth) -> {
-            // 此回调在主线程执行（DatabaseManager会切回主线程）
             if (auth != null) {
-                // ========== 情况B：账号已注册，但本次进服还未登录 ==========
-                // 更新缓存中的账号数据
+                // 情况B：已注册但未登录 → 缓存账号 + 立刻发一次"请登录"大框
                 cache.cacheAuth(uuid, auth);
-                // 更新玩家IP（下次登录信息用，但这里不急，异步更新即可）
                 db.updateLoginInfo(offlineUuidStr, getPlayerIp(player), System.currentTimeMillis());
-                // 强制提示登录
-                player.sendMessage(MessageUtil.get("join-registered"));
+                sendLines(player, MessageUtil.getList("prompt-login"));
             } else {
-                // ========== 情况A：账号未注册 ==========
-                // 缓存里也标记为空，但不加入authCache（isRegistered会返回false）
-                player.sendMessage(MessageUtil.get("join-unregistered"));
+                // 情况A：未注册 → 看开关决定发"请注册"还是"注册已关闭"
+                if (plugin.isAllowRegistration()) {
+                    sendLines(player, MessageUtil.getList("prompt-register"));
+                } else {
+                    sendLines(player, MessageUtil.getList("registration-closed"));
+                }
             }
-            // 情况C：已登录？进服时内存缓存肯定是空的，所以没有"已登录直接放行"的情况
-            // AuthMe设计：每次进服都必须重新登录（防止盗号者复用会话）
         });
     }
 
-    // ===================== 玩家退出：清理内存状态 =====================
-
+    // ===================== 玩家退出：清理 =====================
     @EventHandler(priority = EventPriority.MONITOR)
     public void onPlayerQuit(PlayerQuitEvent event) {
         UUID uuid = event.getPlayer().getUniqueId();
-        // 清除登录状态、账号缓存、失败计数（防止内存泄漏）
         cache.clearPlayer(uuid);
         security.clearPlayer(uuid);
     }
 
-    // ===================== 未登录状态下的各种拦截 =====================
-    // 以下事件统一判断：isLoggedIn(uuid) == false → cancel + 提示
+    // ===================== 命令白名单（支持注册开关）=====================
+    @EventHandler(priority = EventPriority.LOWEST, ignoreCancelled = true)
+    public void onPlayerCommand(PlayerCommandPreprocessEvent event) {
+        Player player = event.getPlayer();
+        UUID uuid = player.getUniqueId();
+        if (cache.isLoggedIn(uuid)) return;
 
-    /**
-     * 拦截玩家移动（AuthMe行为：甚至会把玩家拉回原地）
-     * 注意：PlayerMoveEvent触发非常频繁（每tick可能多次），所以判断要快（内存Set，O(1)）
-     */
+        String msg = event.getMessage().toLowerCase();
+        if (msg.startsWith("/")) msg = msg.substring(1);
+        String cmdName = msg.split(" ")[0];
+
+        // 1. 先判断是不是白名单命令
+        boolean allowCmd = false;
+        boolean isRegisterCmd = false;
+        switch (cmdName) {
+            case "login":
+            case "l":
+                allowCmd = true;
+                break;
+            case "register":
+            case "reg":
+                allowCmd = true;
+                isRegisterCmd = true;
+                break;
+        }
+        if (!allowCmd) {
+            event.setCancelled(true);
+            player.sendMessage(MessageUtil.get("not-logged-in-command"));
+            return;
+        }
+
+        // 2. 注册命令额外检查：若管理员关了注册开关，不允许执行
+        if (isRegisterCmd && !plugin.isAllowRegistration()) {
+            event.setCancelled(true);
+            sendLines(player, MessageUtil.getList("registration-closed"));
+        }
+    }
+
+    // ===================== 移动拦截（即使被外力推，事件也cancel）=====================
     @EventHandler(priority = EventPriority.LOWEST, ignoreCancelled = true)
     public void onPlayerMove(PlayerMoveEvent event) {
         Player player = event.getPlayer();
         if (!cache.isLoggedIn(player.getUniqueId())) {
-            // 只取消位置变化，不取消朝向变化（让玩家可以转头看提示）
             if (event.getFrom().getX() != event.getTo().getX()
                     || event.getFrom().getY() != event.getTo().getY()
                     || event.getFrom().getZ() != event.getTo().getZ()) {
                 event.setCancelled(true);
-                // 不每tick都发消息，刷屏体验差。这里只在需要时提示
-                // 实际AuthMe是通过定时重复提示登录，这里简化
             }
         }
     }
 
-    /**
-     * 拦截未登录玩家聊天
-     */
+    // ===================== 聊天拦截 =====================
     @EventHandler(priority = EventPriority.LOWEST, ignoreCancelled = true)
     public void onPlayerChat(AsyncPlayerChatEvent event) {
         Player player = event.getPlayer();
         if (!cache.isLoggedIn(player.getUniqueId())) {
             event.setCancelled(true);
-            // 注意：这是Async事件，但Bukkit API允许发消息（sendMessage是线程安全的）
             player.sendMessage(MessageUtil.get("not-logged-in-chat"));
         }
     }
 
-    /**
-     * 拦截命令：未登录时仅允许 /login /register /changepassword /logout 及别名
-     * 【重要】：PlayerCommandPreprocessEvent的getMessage()是包含斜杠的原始命令
-     */
+    // ===================== 其他动作拦截 =====================
     @EventHandler(priority = EventPriority.LOWEST, ignoreCancelled = true)
-    public void onPlayerCommand(PlayerCommandPreprocessEvent event) {
-        Player player = event.getPlayer();
-        UUID uuid = player.getUniqueId();
-        if (cache.isLoggedIn(uuid)) {
-            return; // 已登录放行
-        }
+    public void onInteract(PlayerInteractEvent event)     { cancelIfNotLoggedIn(event.getPlayer(), event, "not-logged-in-blocked"); }
+    @EventHandler(priority = EventPriority.LOWEST, ignoreCancelled = true)
+    public void onBlockBreak(BlockBreakEvent event)       { cancelIfNotLoggedIn(event.getPlayer(), event, "not-logged-in-blocked"); }
+    @EventHandler(priority = EventPriority.LOWEST, ignoreCancelled = true)
+    public void onBlockPlace(BlockPlaceEvent event)       { cancelIfNotLoggedIn(event.getPlayer(), event, "not-logged-in-blocked"); }
+    @EventHandler(priority = EventPriority.LOWEST, ignoreCancelled = true)
+    public void onOpenInventory(InventoryOpenEvent event) { if (event.getPlayer() instanceof Player) cancelIfNotLoggedIn((Player) event.getPlayer(), event, "not-logged-in-blocked"); }
+    @EventHandler(priority = EventPriority.LOWEST, ignoreCancelled = true)
+    public void onDropItem(PlayerDropItemEvent event)     { cancelIfNotLoggedIn(event.getPlayer(), event, "not-logged-in-blocked"); }
+    @EventHandler(priority = EventPriority.LOWEST, ignoreCancelled = true)
+    public void onPickupItem(PlayerPickupItemEvent event) { cancelIfNotLoggedIn(event.getPlayer(), event, null); }
 
-        // 解析命令（去掉开头斜杠，转小写）
-        String message = event.getMessage().toLowerCase();
-        if (message.startsWith("/")) {
-            message = message.substring(1);
-        }
-        String cmdName = message.split(" ")[0]; // 取第一个空格前的部分
-
-        // 白名单：login / l / register / reg 及它们的别名
-        boolean isAllowed = false;
-        switch (cmdName) {
-            case "login":
-            case "l":
-            case "register":
-            case "reg":
-                isAllowed = true;
-                break;
-        }
-
-        if (!isAllowed) {
-            event.setCancelled(true);
-            player.sendMessage(MessageUtil.get("not-logged-in-command"));
+    // 【新增】拦截上矿车/上船/骑猪（防止玩家靠骑乘离开出生点）
+    @EventHandler(priority = EventPriority.LOWEST, ignoreCancelled = true)
+    public void onVehicleEnter(VehicleEnterEvent event) {
+        if (event.getEntered() instanceof Player) {
+            cancelIfNotLoggedIn((Player) event.getEntered(), event, "not-logged-in-blocked");
         }
     }
 
-    /**
-     * 拦截交互（右键点击方块/物品等，包括开箱子、开按钮、开矿车）
-     */
+    // 【新增】拦截受伤（包括PVP、自残、跌落、爆炸），防止未登录玩家靠自杀/卡BUG
     @EventHandler(priority = EventPriority.LOWEST, ignoreCancelled = true)
-    public void onPlayerInteract(PlayerInteractEvent event) {
+    public void onEntityDamage(EntityDamageEvent event) {
+        if (event.getEntity() instanceof Player) {
+            Player p = (Player) event.getEntity();
+            if (!cache.isLoggedIn(p.getUniqueId())) {
+                event.setCancelled(true);
+            }
+        }
+    }
+
+    // 【新增】拦截饥饿度变化，未登录玩家不会饿也不会回血
+    @EventHandler(priority = EventPriority.LOWEST, ignoreCancelled = true)
+    public void onFoodLevelChange(FoodLevelChangeEvent event) {
+        if (event.getEntity() instanceof Player) {
+            Player p = (Player) event.getEntity();
+            if (!cache.isLoggedIn(p.getUniqueId())) {
+                event.setCancelled(true);
+            }
+        }
+    }
+
+    // 【新增】拦截玩家使用物品（吃东西、喝药水、丢末影珍珠等）
+    @EventHandler(priority = EventPriority.LOWEST, ignoreCancelled = true)
+    public void onPlayerItemConsume(PlayerItemConsumeEvent event) {
         cancelIfNotLoggedIn(event.getPlayer(), event, "not-logged-in-blocked");
     }
 
-    /**
-     * 拦截破坏方块
-     */
-    @EventHandler(priority = EventPriority.LOWEST, ignoreCancelled = true)
-    public void onBlockBreak(BlockBreakEvent event) {
-        cancelIfNotLoggedIn(event.getPlayer(), event, "not-logged-in-blocked");
-    }
-
-    /**
-     * 拦截放置方块
-     */
-    @EventHandler(priority = EventPriority.LOWEST, ignoreCancelled = true)
-    public void onBlockPlace(BlockPlaceEvent event) {
-        cancelIfNotLoggedIn(event.getPlayer(), event, "not-logged-in-blocked");
-    }
-
-    /**
-     * 拦截打开背包/箱子
-     */
-    @EventHandler(priority = EventPriority.LOWEST, ignoreCancelled = true)
-    public void onInventoryOpen(InventoryOpenEvent event) {
-        if (event.getPlayer() instanceof Player) {
-            cancelIfNotLoggedIn((Player) event.getPlayer(), event, "not-logged-in-blocked");
-        }
-    }
-
-    /**
-     * 拦截丢物品
-     */
-    @EventHandler(priority = EventPriority.LOWEST, ignoreCancelled = true)
-    public void onPlayerDropItem(PlayerDropItemEvent event) {
-        cancelIfNotLoggedIn(event.getPlayer(), event, "not-logged-in-blocked");
-    }
-
-    /**
-     * 拦截拾取物品（未登录不能捡东西）
-     */
-    @EventHandler(priority = EventPriority.LOWEST, ignoreCancelled = true)
-    public void onPlayerPickupItem(PlayerPickupItemEvent event) {
-        cancelIfNotLoggedIn(event.getPlayer(), event, null);
-    }
-
-    // ===================== 辅助方法 =====================
-
-    /**
-     * 通用拦截辅助：玩家未登录就取消事件+发消息
-     *
-     * @param messageKey 消息配置key；传null表示静默取消（不发消息）
-     */
+    // ===================== 辅助 =====================
     private void cancelIfNotLoggedIn(Player player, Cancellable event, String messageKey) {
         if (player == null || event == null) return;
         if (!cache.isLoggedIn(player.getUniqueId())) {
@@ -235,16 +215,16 @@ public class PlayerListener implements Listener {
         }
     }
 
-    /**
-     * 获取玩家IP字符串（容错：避免getAddress()返回null时报NPE）
-     */
+    private void sendLines(Player player, List<String> lines) {
+        for (String l : lines) player.sendMessage(l);
+    }
+
     private String getPlayerIp(Player player) {
         try {
             if (player.getAddress() != null && player.getAddress().getAddress() != null) {
                 return player.getAddress().getAddress().getHostAddress();
             }
-        } catch (Exception ignored) {
-        }
+        } catch (Exception ignored) {}
         return "unknown";
     }
 }

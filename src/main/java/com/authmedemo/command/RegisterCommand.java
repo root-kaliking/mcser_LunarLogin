@@ -21,6 +21,7 @@ import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
 import org.bukkit.entity.Player;
 
+import java.util.List;
 import java.util.UUID;
 
 public class RegisterCommand implements CommandExecutor {
@@ -48,6 +49,12 @@ public class RegisterCommand implements CommandExecutor {
         }
         Player player = (Player) sender;
         UUID uuid = player.getUniqueId();
+
+        // ===== 【新增】先检查注册总开关：管理员已关闭注册 =====
+        if (!plugin.isAllowRegistration()) {
+            sendLines(player, MessageUtil.getList("registration-closed"));
+            return true;
+        }
 
         // ===== 2. 已经登录了，不让重复注册 =====
         if (cache.isLoggedIn(uuid)) {
@@ -101,7 +108,8 @@ public class RegisterCommand implements CommandExecutor {
                 cache.cacheAuth(uuid, newAuth);
                 cache.setLoggedIn(uuid);
                 security.clearFailState(uuid);
-                player.sendMessage(MessageUtil.get("register-success"));
+                // 发送多行"注册成功"大框
+                sendLines(player, MessageUtil.getList("register-success"));
             } else {
                 // 插入失败：可能是并发注册导致冲突，兜底提示
                 player.sendMessage(MessageUtil.get("database-error"));
@@ -116,6 +124,11 @@ public class RegisterCommand implements CommandExecutor {
         });
 
         return true;
+    }
+
+    // 辅助：发送多行消息
+    private void sendLines(Player player, List<String> lines) {
+        for (String l : lines) player.sendMessage(l);
     }
 
     private String getPlayerIp(Player player) {
